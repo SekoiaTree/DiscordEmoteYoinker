@@ -18,26 +18,39 @@ var images = []
 
 onready var download_button = $Download/Button
 onready var upload_button = $Upload/Button3
+onready var error_text = $Label
 
 # Called when the node enters the scene tree for the first time.
 func _ready():
-	var err = http.connect_to_host("https://discord.com")
-	assert(err == OK)
-	while http.get_status() == HTTPClient.STATUS_CONNECTING or http.get_status() == HTTPClient.STATUS_RESOLVING:
-		http.poll()
-		if not OS.has_feature("web"):
-			OS.delay_msec(1)
-		else:
-			yield(Engine.get_main_loop(), "idle_frame")
+	var err = -1
+	while err != OK:
+		err = http.connect_to_host("https://discord.com")
+		OS.delay_msec(1)
 	
-	err = emoji_http.connect_to_host("https://cdn.discordapp.com")
-	assert(err == OK)
-	while emoji_http.get_status() == HTTPClient.STATUS_CONNECTING or emoji_http.get_status() == HTTPClient.STATUS_RESOLVING:
-		emoji_http.poll()
-		if not OS.has_feature("web"):
+	var ready = false
+	while http.get_status() == HTTPClient.STATUS_DISCONNECTED or not ready:
+		ready = true
+		while http.get_status() == HTTPClient.STATUS_CONNECTING or http.get_status() == HTTPClient.STATUS_RESOLVING:
+			http.poll()
 			OS.delay_msec(1)
-		else:
-			yield(Engine.get_main_loop(), "idle_frame")
+		if http.get_status() == HTTPClient.STATUS_DISCONNECTED:
+			OS.delay_msec(200)
+	
+	err = -1
+	while err != OK:
+		err = emoji_http.connect_to_host("https://cdn.discordapp.com")
+		OS.delay_msec(1)
+	
+	ready = false
+	while emoji_http.get_status() == HTTPClient.STATUS_DISCONNECTED or not ready:
+		ready = true
+		while emoji_http.get_status() == HTTPClient.STATUS_CONNECTING or emoji_http.get_status() == HTTPClient.STATUS_RESOLVING:
+			emoji_http.poll()
+			OS.delay_msec(1)
+		
+		if emoji_http.get_status() == HTTPClient.STATUS_DISCONNECTED:
+			OS.delay_msec(200)
+	
 	get_tree().create_timer(0.1).connect("timeout", self, "_on_resized")
 
 # Called every frame. 'delta' is the elapsed time since the previous frame.
@@ -54,10 +67,15 @@ func _on_Button_pressed():
 	var rb = request_await("/api/v9/guilds/"+sourceID+"/emojis", token, http)
 	var result = rb.get_string_from_utf8()
 	var json = JSON.parse(result)
-	if json.error:
-		return #TODO
+	if json.error != OK:
+		error_text.display_error("Could not parse JSON!")
+		return
 	
 	result = json.result
+	
+	if not result is Array:
+		error_text.display_error("Failed to fetch emojis. Check if you inputted your data correctly, then try again.")
+		return
 	state = State.DOWNLOADING
 	download_button.disabled = true
 	upload_button.disabled = true
@@ -85,10 +103,11 @@ func upload():
 			http.poll()
 			var chunk = http.read_response_body_chunk()
 			if chunk.size() == 0:
-				if not OS.has_feature("web"):
-					OS.delay_usec(1000)
-				else:
-					yield(Engine.get_main_loop(), "idle_frame")
+				OS.delay_usec(1000)
+		if http.get_response_code() < 200 or http.get_response_code() >= 300:
+			error_text.display_error("Failed to send request, with code " + str(http.get_response_code())+". This probably disconnected us, so you'll have to restart. Sorry!")
+			get_tree().paused = true
+			return
 	
 	current_emoji += 1
 	while current_emoji < emojis.size() && not $ScrollContainer/GridContainer.get_child(current_emoji).pressed:
@@ -120,7 +139,8 @@ func download():
 	var image = Image.new()
 	var error = image.load_png_from_buffer(rb)
 	if error != OK:
-		push_error("Couldn't load the image")
+		error_text.display_error("Couldn't load image!")
+		return
 	var texture = ImageTexture.new()
 	texture.flags = texture.flags & ~ImageTexture.FLAG_FILTER
 	texture.create_from_image(image)
@@ -155,18 +175,16 @@ func get_from_client(client : HTTPClient):
 		# Get a chunk.
 		var chunk = client.read_response_body_chunk()
 		if chunk.size() == 0:
-			if not OS.has_feature("web"):
-				# Got nothing, wait for buffers to fill a bit.
-				OS.delay_usec(1000)
-			else:
-				yield(Engine.get_main_loop(), "idle_frame")
+			OS.delay_usec(1000)
 		else:
 			rb = rb + chunk # Append to read buffer.
 	return rb
 
 func request(path : String, client : HTTPClient):
 	var err = client.request(HTTPClient.METHOD_GET, path, [])
-	assert(err == OK)
+	if err != OK:
+		error_text.display_error("Failed to request! You'll have to restart, sorry!")
+		get_tree().paused = true
 
 func request_await(path : String, token : String, client : HTTPClient, auth : bool = true):
 	var err
@@ -175,16 +193,11 @@ func request_await(path : String, token : String, client : HTTPClient, auth : bo
 	else:
 		err = client.request(HTTPClient.METHOD_GET, path, [])
 	assert(err == OK)
+	
 	while client.get_status() == HTTPClient.STATUS_REQUESTING:
 		# Keep polling for as long as the request is being processed.
 		client.poll()
-		if OS.has_feature("web"):
-			# Synchronous HTTP requests are not supported on the web,
-			# so wait for the next main loop iteration.
-			yield(Engine.get_main_loop(), "idle_frame")
-		else:
-			OS.delay_usec(500)
-	assert(client.get_status() == HTTPClient.STATUS_BODY or client.get_status() == HTTPClient.STATUS_CONNECTED) # Make sure request finished well.
+		OS.delay_usec(500)
 	
 	if client.has_response():
 		var rb = PoolByteArray()
@@ -192,14 +205,12 @@ func request_await(path : String, token : String, client : HTTPClient, auth : bo
 			client.poll()
 			var chunk = client.read_response_body_chunk()
 			if chunk.size() == 0:
-				if not OS.has_feature("web"):
-					OS.delay_usec(1000)
-				else:
-					yield(Engine.get_main_loop(), "idle_frame")
+				OS.delay_usec(1000)
 			else:
 				rb = rb + chunk
 		return rb
 	else:
+		error_text.display_error("Failed to get something, no response received. Sorry!")
 		return null
 
 func _on_resized():
